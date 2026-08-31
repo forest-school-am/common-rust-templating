@@ -51,6 +51,12 @@ pub enum RenderError {
     Io(String, String),
     #[error("render of {0} failed: {1}")]
     Render(String, String),
+    /// The asset name is not a safe relative path under the asset root — an
+    /// absolute path, a `..` segment, or a symlink escaping the root (§9.5b).
+    /// Asset names from requests are untrusted; this rejection lives here so no
+    /// adopter can forget it.
+    #[error("unsafe asset name (path traversal / escape rejected): {0}")]
+    UnsafeName(String),
 }
 
 enum Entry {
@@ -62,6 +68,9 @@ enum Entry {
 /// (wrap in `Arc` in your `AppState`).
 pub struct AssetCache {
     root: PathBuf,
+    /// The asset root with symlinks resolved — the containment boundary every
+    /// resolved asset path must stay under (§9.5b).
+    canonical_root: PathBuf,
     env: Environment<'static>,
     pins: HashMap<String, [u8; 32]>,
     entries: RwLock<HashMap<String, Entry>>,
@@ -100,6 +109,11 @@ impl Builder {
         if !self.root.is_dir() {
             return Err(RenderError::BadDir(self.root));
         }
+        // Resolve the root once — the containment boundary for §9.5b.
+        let canonical_root = self
+            .root
+            .canonicalize()
+            .map_err(|e| RenderError::Io(self.root.display().to_string(), e.to_string()))?;
         let mut env = Environment::new();
         // §9.3: escape only HTML contexts; JS/text assets are not escaped.
         env.set_auto_escape_callback(|name| {
@@ -112,6 +126,7 @@ impl Builder {
 
         let cache = AssetCache {
             root: self.root,
+            canonical_root,
             env,
             pins: self.pins,
             entries: RwLock::new(HashMap::new()),
@@ -119,11 +134,12 @@ impl Builder {
 
         // pins first (also reads the bytes), then parse-check required templates
         for (name, expected) in &cache.pins {
-            let bytes = cache.read_verified(name, Some(expected))?;
-            let _ = bytes; // just verifying it reads + matches
+            let path = cache.safe_path(name)?;
+            cache.read_verified(&path, name, Some(expected))?;
         }
         for name in &self.required {
-            let src = String::from_utf8(cache.read_verified(name, cache.pins.get(name))?)
+            let path = cache.safe_path(name)?;
+            let src = String::from_utf8(cache.read_verified(&path, name, cache.pins.get(name))?)
                 .map_err(|e| RenderError::Parse(name.clone(), e.to_string()))?;
             cache
                 .env
@@ -135,8 +151,30 @@ impl Builder {
 }
 
 impl AssetCache {
-    fn path(&self, name: &str) -> PathBuf {
-        self.root.join(name)
+    /// Resolve an untrusted asset `name` to a filesystem path that is proven to
+    /// stay under the asset root (§9.5b). Rejects absolute paths and any
+    /// non-`Normal`/`CurDir` component (`..`, root, prefix) BEFORE touching the
+    /// filesystem, then canonicalizes and requires containment under
+    /// `canonical_root` — which catches a symlink INSIDE the root pointing out
+    /// (the component check alone would not). A name that is structurally safe
+    /// but simply does not exist yet returns its joined path; the normal
+    /// `Missing` flow handles it downstream (no content can leak from a file
+    /// that is not there).
+    fn safe_path(&self, name: &str) -> Result<PathBuf, RenderError> {
+        let rel = Path::new(name);
+        for component in rel.components() {
+            match component {
+                std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+                _ => return Err(RenderError::UnsafeName(name.to_owned())),
+            }
+        }
+        let joined = self.root.join(rel);
+        match joined.canonicalize() {
+            Ok(real) if real.starts_with(&self.canonical_root) => Ok(real),
+            Ok(_) => Err(RenderError::UnsafeName(name.to_owned())), // symlink escaped the root
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(joined),
+            Err(e) => Err(RenderError::Io(name.to_owned(), e.to_string())),
+        }
     }
 
     fn mtime(&self, path: &Path, name: &str) -> Result<SystemTime, RenderError> {
@@ -151,10 +189,16 @@ impl AssetCache {
             })
     }
 
-    /// Read a file's bytes, verifying its pin if one is expected (§9.7b/§9.8).
-    fn read_verified(&self, name: &str, expected: Option<&[u8; 32]>) -> Result<Vec<u8>, RenderError> {
-        let path = self.path(name);
-        let bytes = std::fs::read(&path).map_err(|e| {
+    /// Read a pre-validated (`safe_path`) file's bytes, verifying its pin if one
+    /// is expected (§9.7b/§9.8). Takes the resolved path so it can never be
+    /// handed a raw untrusted name.
+    fn read_verified(
+        &self,
+        path: &Path,
+        name: &str,
+        expected: Option<&[u8; 32]>,
+    ) -> Result<Vec<u8>, RenderError> {
+        let bytes = std::fs::read(path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 RenderError::Missing(name.to_owned())
             } else {
@@ -173,7 +217,7 @@ impl AssetCache {
     /// §9.5 template mode: render `name` with `params`, cached by (mtime,
     /// params). Re-renders on the next call after either changes.
     pub fn render(&self, name: &str, params: &[(&str, &str)]) -> Result<Arc<str>, RenderError> {
-        let path = self.path(name);
+        let path = self.safe_path(name)?; // §9.5b: reject traversal before any FS/cache touch
         let mtime = self.mtime(&path, name)?;
         let key = params_key(params);
 
@@ -185,7 +229,7 @@ impl AssetCache {
             }
         }
 
-        let src = String::from_utf8(self.read_verified(name, self.pins.get(name))?)
+        let src = String::from_utf8(self.read_verified(&path, name, self.pins.get(name))?)
             .map_err(|e| RenderError::Render(name.to_owned(), e.to_string()))?;
         let ctx: BTreeMap<&str, &str> = params.iter().copied().collect();
         let tmpl = self
@@ -206,12 +250,14 @@ impl AssetCache {
     /// cache keyed on the context would only ever miss (see the cron-viewer
     /// exemption that motivated this entry point). Guarantees preserved from
     /// the cached paths:
+    ///
     /// - the entry template's integrity pin is verified on EVERY call via
     ///   `read_verified` — an uncached path must not become a pin-bypass path;
     /// - the template is re-read from disk each call (a fresh per-call
     ///   `Environment`, so minijinja's internal parse cache cannot serve a
     ///   stale template) — §9.2a's edit-without-restart holds here too;
     /// - the same autoescape policy applies (§9.3).
+    ///
     /// `{% extends %}`/`{% include %}` resolve through a path loader rooted at
     /// the validated asset dir. Note: pins are verified for the ENTRY template;
     /// a pinned file pulled in only via extends/include is verified when it is
@@ -221,8 +267,9 @@ impl AssetCache {
         name: &str,
         ctx: &S,
     ) -> Result<String, RenderError> {
-        // pin + existence check through the same verified read path
-        let _ = self.read_verified(name, self.pins.get(name))?;
+        // §9.5b: reject traversal, then pin + existence check on the safe path.
+        let path = self.safe_path(name)?;
+        let _ = self.read_verified(&path, name, self.pins.get(name))?;
         let mut env = Environment::new();
         env.set_auto_escape_callback(|name| {
             if name.ends_with(".html") || name.ends_with(".htm") {
@@ -246,7 +293,7 @@ impl AssetCache {
     /// §9.5a static mode: serve `name`'s bytes, cached by (mtime) alone.
     /// Re-reads on the next call after the file's mtime changes.
     pub fn static_file(&self, name: &str) -> Result<Arc<[u8]>, RenderError> {
-        let path = self.path(name);
+        let path = self.safe_path(name)?; // §9.5b: reject traversal before any FS/cache touch
         let mtime = self.mtime(&path, name)?;
 
         if let Ok(entries) = self.entries.read() {
@@ -257,7 +304,7 @@ impl AssetCache {
             }
         }
 
-        let bytes: Arc<[u8]> = Arc::from(self.read_verified(name, self.pins.get(name))?);
+        let bytes: Arc<[u8]> = Arc::from(self.read_verified(&path, name, self.pins.get(name))?);
         if let Ok(mut entries) = self.entries.write() {
             entries.insert(name.to_owned(), Entry::Static { mtime, bytes: bytes.clone() });
         }
@@ -473,5 +520,52 @@ mod tests {
         let c = Builder::new(&d).build().unwrap();
         assert_eq!(&*c.render("p.html", &[("v", "<x>")]).unwrap(), "<b>&lt;x&gt;</b>");
         assert_eq!(&*c.render("p.js.jinja", &[("v", "<x>")]).unwrap(), "x = <x>");
+    }
+
+    // §9.5b negative-space (§7.1): untrusted names must not escape the root.
+    #[test]
+    fn traversal_names_rejected_on_every_entry_point() {
+        let d = tmpdir();
+        write(&d, "ok.txt", "ok");
+        write(&d, "t.js.jinja", "x = {{ v }}");
+        let c = Builder::new(&d).build().unwrap();
+        // sanity: a legitimate name still works
+        assert_eq!(&*c.static_file("ok.txt").unwrap(), b"ok");
+
+        for bad in ["../../etc/passwd", "../secret", "/etc/passwd", "a/../../b", "./../x"] {
+            assert!(
+                matches!(c.static_file(bad), Err(RenderError::UnsafeName(_))),
+                "static_file({bad:?}) not rejected"
+            );
+            assert!(
+                matches!(c.render(bad, &[]), Err(RenderError::UnsafeName(_))),
+                "render({bad:?}) not rejected"
+            );
+            assert!(
+                matches!(c.render_ctx(bad, &()), Err(RenderError::UnsafeName(_))),
+                "render_ctx({bad:?}) not rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn symlink_escaping_root_is_rejected() {
+        // root/ holds inside.txt; its PARENT holds outside.txt; a symlink inside
+        // the root points at the parent — reading through it must be rejected,
+        // not served (the `..`-component check alone wouldn't catch this).
+        let parent = tmpdir();
+        fs::write(parent.join("outside.txt"), "SECRET").unwrap();
+        let root = parent.join("assets");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("inside.txt"), "ok").unwrap();
+        std::os::unix::fs::symlink(&parent, root.join("up")).unwrap();
+
+        let c = Builder::new(&root).build().unwrap();
+        assert_eq!(&*c.static_file("inside.txt").unwrap(), b"ok");
+        // "up" resolves (via symlink) to the parent, escaping the root
+        assert!(matches!(
+            c.static_file("up/outside.txt"),
+            Err(RenderError::UnsafeName(_))
+        ));
     }
 }

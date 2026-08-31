@@ -55,6 +55,15 @@ an `Arc` in your `AppState`.
   templates that must not drift from the crate version. Produce the constant
   with `stand_render::sha256(bytes)`.
 
+## Untrusted names (§9.5b)
+
+Asset names are treated as untrusted input — an adopter that serves a bundle by
+URL path passes a request-influenced name straight in. All three name-taking
+methods reject absolute paths, `..` segments, and symlinks escaping the root
+(canonicalize + containment) before any filesystem access, returning
+`RenderError::UnsafeName`. The guard lives in the crate so no adopter has to
+remember it.
+
 ## Scope (§9.7a)
 
 Served content only. Embedded data never sent to a client (seed data,

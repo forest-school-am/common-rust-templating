@@ -20,6 +20,12 @@ directory. Used only by services that serve assets — kept SEPARATE from
   on every reload; mismatch refuses to serve. Pins are for server-enforced
   logic and library templates that must not drift.
 - Autoescape (§9.3): HTML on, JS/text off — by extension.
+- Asset names are UNTRUSTED (§9.5b): every name-taking method (render,
+  render_ctx, static_file) routes through `safe_path` first — rejects absolute
+  paths and any `..`/root/prefix component, then canonicalizes and requires
+  containment under the resolved root (catches an in-root symlink pointing
+  out). The rejection lives HERE so no adopter serving assets by request path
+  can forget it. Negative-space tests cover `..`, absolute, and symlink escape.
 - Scope is SERVED content only (§9.7a); embedded non-served data is fine
   elsewhere.
 
