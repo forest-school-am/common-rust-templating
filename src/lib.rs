@@ -201,6 +201,48 @@ impl AssetCache {
         Ok(out)
     }
 
+    /// §9.4 data-driven mode: render `name` with a full serializable context,
+    /// UNCACHED by definition — data-driven pages change per request, so a
+    /// cache keyed on the context would only ever miss (see the cron-viewer
+    /// exemption that motivated this entry point). Guarantees preserved from
+    /// the cached paths:
+    /// - the entry template's integrity pin is verified on EVERY call via
+    ///   `read_verified` — an uncached path must not become a pin-bypass path;
+    /// - the template is re-read from disk each call (a fresh per-call
+    ///   `Environment`, so minijinja's internal parse cache cannot serve a
+    ///   stale template) — §9.2a's edit-without-restart holds here too;
+    /// - the same autoescape policy applies (§9.3).
+    /// `{% extends %}`/`{% include %}` resolve through a path loader rooted at
+    /// the validated asset dir. Note: pins are verified for the ENTRY template;
+    /// a pinned file pulled in only via extends/include is verified when it is
+    /// itself rendered or served, not transitively.
+    pub fn render_ctx<S: serde::Serialize>(
+        &self,
+        name: &str,
+        ctx: &S,
+    ) -> Result<String, RenderError> {
+        // pin + existence check through the same verified read path
+        let _ = self.read_verified(name, self.pins.get(name))?;
+        let mut env = Environment::new();
+        env.set_auto_escape_callback(|name| {
+            if name.ends_with(".html") || name.ends_with(".htm") {
+                AutoEscape::Html
+            } else {
+                AutoEscape::None
+            }
+        });
+        env.set_loader(minijinja::path_loader(&self.root));
+        let tmpl = env.get_template(name).map_err(|e| {
+            if e.kind() == minijinja::ErrorKind::TemplateNotFound {
+                RenderError::Missing(name.to_owned())
+            } else {
+                RenderError::Parse(name.to_owned(), e.to_string())
+            }
+        })?;
+        tmpl.render(minijinja::value::Value::from_serialize(ctx))
+            .map_err(|e| RenderError::Render(name.to_owned(), e.to_string()))
+    }
+
     /// §9.5a static mode: serve `name`'s bytes, cached by (mtime) alone.
     /// Re-reads on the next call after the file's mtime changes.
     pub fn static_file(&self, name: &str) -> Result<Arc<[u8]>, RenderError> {
@@ -352,6 +394,75 @@ mod tests {
         write(&d, "logic.js", "tampered();");
         bump_mtime(&d, "logic.js");
         assert!(matches!(c.static_file("logic.js"), Err(RenderError::PinMismatch(_))));
+    }
+
+    #[test]
+    fn render_ctx_takes_structured_context_and_iterates() {
+        let d = tmpdir();
+        write(&d, "list.html", "{% for t in tasks %}<li>{{ t.name }}</li>{% endfor %}");
+        let c = Builder::new(&d).require_template("list.html").build().unwrap();
+        #[derive(serde::Serialize)]
+        struct Ctx {
+            tasks: Vec<Row>,
+        }
+        #[derive(serde::Serialize)]
+        struct Row {
+            name: String,
+        }
+        let out = c
+            .render_ctx(
+                "list.html",
+                &Ctx { tasks: vec![Row { name: "a".into() }, Row { name: "<b>".into() }] },
+            )
+            .unwrap();
+        assert_eq!(out, "<li>a</li><li>&lt;b&gt;</li>", "iteration + autoescape");
+    }
+
+    #[test]
+    fn render_ctx_supports_extends_and_edits_without_restart() {
+        let d = tmpdir();
+        write(&d, "base.html", "[{% block body %}{% endblock %}]");
+        write(&d, "page.html", "{% extends \"base.html\" %}{% block body %}{{ n }}{% endblock %}");
+        let c = Builder::new(&d).require_template("page.html").build().unwrap();
+        #[derive(serde::Serialize)]
+        struct Ctx {
+            n: u32,
+        }
+        assert_eq!(c.render_ctx("page.html", &Ctx { n: 1 }).unwrap(), "[1]");
+        // edit the base template: must take effect on the very next render
+        std::thread::sleep(Duration::from_millis(5));
+        write(&d, "base.html", "({% block body %}{% endblock %})");
+        bump_mtime(&d, "base.html");
+        assert_eq!(
+            c.render_ctx("page.html", &Ctx { n: 2 }).unwrap(),
+            "(2)",
+            "template edits must take effect without restart on the uncached path"
+        );
+    }
+
+    #[test]
+    fn render_ctx_verifies_pins_and_reports_missing() {
+        let d = tmpdir();
+        write(&d, "pinned.html", "ok {{ x }}");
+        let good = sha256(b"ok {{ x }}");
+        let c = Builder::new(&d).pin("pinned.html", good).build().unwrap();
+        #[derive(serde::Serialize)]
+        struct Ctx {
+            x: u32,
+        }
+        assert_eq!(c.render_ctx("pinned.html", &Ctx { x: 7 }).unwrap(), "ok 7");
+        // drift -> the uncached path must also refuse (no pin bypass)
+        std::thread::sleep(Duration::from_millis(5));
+        write(&d, "pinned.html", "tampered {{ x }}");
+        bump_mtime(&d, "pinned.html");
+        assert!(matches!(
+            c.render_ctx("pinned.html", &Ctx { x: 7 }),
+            Err(RenderError::PinMismatch(_))
+        ));
+        assert!(matches!(
+            c.render_ctx("absent.html", &Ctx { x: 7 }),
+            Err(RenderError::Missing(_))
+        ));
     }
 
     #[test]
