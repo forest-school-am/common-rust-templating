@@ -64,6 +64,30 @@ enum Entry {
     Static { mtime: SystemTime, bytes: Arc<[u8]> },
 }
 
+/// §9.3 autoescape policy by extension: HTML contexts on, JS/text off.
+fn autoescape(name: &str) -> AutoEscape {
+    if name.ends_with(".html") || name.ends_with(".htm") {
+        AutoEscape::Html
+    } else {
+        AutoEscape::None
+    }
+}
+
+/// A long-lived minijinja `Environment` for `render_ctx` (loader-backed, so
+/// `{% extends %}`/`{% include %}` resolve) plus the mtimes of the templates it
+/// has loaded. The steady state re-parses NOTHING; an edit to the entry OR any
+/// loaded parent is detected by stat-vs-recorded-mtime and drops the whole
+/// compiled set via `clear_templates()`, so §9.2a edit-without-restart holds
+/// for partials too (which the old per-call `Environment::new()` achieved only
+/// by brute-force re-parsing every call).
+struct CtxEnv {
+    env: Environment<'static>,
+    mtimes: HashMap<String, SystemTime>,
+    /// Slow-path (load/reload) count — steady-state renders must NOT bump it.
+    /// Observability, and the anchor the no-re-parse test asserts against.
+    loads: u64,
+}
+
 /// Rendering cache over a validated asset directory. Cheap to clone-share
 /// (wrap in `Arc` in your `AppState`).
 pub struct AssetCache {
@@ -72,6 +96,9 @@ pub struct AssetCache {
     /// resolved asset path must stay under (§9.5b).
     canonical_root: PathBuf,
     env: Environment<'static>,
+    /// Long-lived loader env for `render_ctx`, with mtime-driven invalidation.
+    /// Write-locked only on (re)load, so steady-state renders don't serialize.
+    ctx_env: RwLock<CtxEnv>,
     pins: HashMap<String, [u8; 32]>,
     entries: RwLock<HashMap<String, Entry>>,
 }
@@ -114,20 +141,22 @@ impl Builder {
             .root
             .canonicalize()
             .map_err(|e| RenderError::Io(self.root.display().to_string(), e.to_string()))?;
+        // `env` serves render()'s ad-hoc `template_from_named_str` (no loader);
+        // its own entries cache handles invalidation.
         let mut env = Environment::new();
-        // §9.3: escape only HTML contexts; JS/text assets are not escaped.
-        env.set_auto_escape_callback(|name| {
-            if name.ends_with(".html") || name.ends_with(".htm") {
-                AutoEscape::Html
-            } else {
-                AutoEscape::None
-            }
-        });
+        env.set_auto_escape_callback(autoescape);
+
+        // `ctx_env` is the long-lived loader env for render_ctx (§9.4). Loader
+        // + autoescape installed ONCE here, not per call.
+        let mut ctx_env = Environment::new();
+        ctx_env.set_auto_escape_callback(autoescape);
+        ctx_env.set_loader(minijinja::path_loader(&canonical_root));
 
         let cache = AssetCache {
             root: self.root,
             canonical_root,
             env,
+            ctx_env: RwLock::new(CtxEnv { env: ctx_env, mtimes: HashMap::new(), loads: 0 }),
             pins: self.pins,
             entries: RwLock::new(HashMap::new()),
         };
@@ -276,15 +305,45 @@ impl AssetCache {
         // §9.5b: reject traversal, then pin + existence check on the safe path.
         let path = self.safe_path(name)?;
         let _ = self.read_verified(&path, name, self.pins.get(name))?;
-        let mut env = Environment::new();
-        env.set_auto_escape_callback(|name| {
-            if name.ends_with(".html") || name.ends_with(".htm") {
-                AutoEscape::Html
-            } else {
-                AutoEscape::None
+
+        // Fast path (steady state): entry already loaded and no loaded template
+        // (entry OR parent) changed on disk — a READ lock, no re-parse, no
+        // serialization against concurrent renders.
+        {
+            let g = self.ctx_env.read().unwrap_or_else(|e| e.into_inner());
+            if g.mtimes.contains_key(name) && !self.loaded_stale(&g) {
+                return self.ctx_render(&g.env, name, ctx);
             }
-        });
-        env.set_loader(minijinja::path_loader(&self.root));
+        }
+
+        // Slow path: (re)load under the WRITE lock. If any loaded template
+        // changed, drop the whole compiled set (clear_templates is
+        // all-or-nothing — fine at this scale) so the edit is picked up (§9.2a
+        // for partials); then render (loading the entry + its extends/include
+        // parents via the loader) and record every loaded template's mtime.
+        let mut g = self.ctx_env.write().unwrap_or_else(|e| e.into_inner());
+        g.loads += 1;
+        if self.loaded_stale(&g) {
+            g.env.clear_templates();
+            g.mtimes.clear();
+        }
+        let out = self.ctx_render(&g.env, name, ctx)?;
+        let loaded: Vec<String> = g.env.templates().map(|(n, _)| n.to_owned()).collect();
+        for tname in loaded {
+            if let Ok(mt) = self.canonical_root.join(&tname).metadata().and_then(|m| m.modified()) {
+                g.mtimes.insert(tname, mt);
+            }
+        }
+        Ok(out)
+    }
+
+    /// get_template (loader-backed) + render, mapping minijinja errors.
+    fn ctx_render<S: serde::Serialize>(
+        &self,
+        env: &Environment<'static>,
+        name: &str,
+        ctx: &S,
+    ) -> Result<String, RenderError> {
         let tmpl = env.get_template(name).map_err(|e| {
             if e.kind() == minijinja::ErrorKind::TemplateNotFound {
                 RenderError::Missing(name.to_owned())
@@ -294,6 +353,17 @@ impl AssetCache {
         })?;
         tmpl.render(minijinja::value::Value::from_serialize(ctx))
             .map_err(|e| RenderError::Render(name.to_owned(), e.to_string()))
+    }
+
+    /// Has any template the ctx env has loaded changed (or vanished) on disk
+    /// since it was recorded? Checks the entry AND every extends/include parent.
+    fn loaded_stale(&self, g: &CtxEnv) -> bool {
+        g.mtimes.iter().any(|(tname, recorded)| {
+            match self.canonical_root.join(tname).metadata().and_then(|m| m.modified()) {
+                Ok(now) => now != *recorded,
+                Err(_) => true,
+            }
+        })
     }
 
     /// §9.5a static mode: serve `name`'s bytes, cached by (mtime) alone.
@@ -591,5 +661,38 @@ mod tests {
         // Missing at safe_path — never Ok(unvalidated path), never UnsafeName.
         assert!(matches!(c.static_file("absent.txt"), Err(RenderError::Missing(_))));
         assert!(matches!(c.render("absent.js.jinja", &[]), Err(RenderError::Missing(_))));
+    }
+
+    #[test]
+    fn render_ctx_steady_state_no_reparse_but_partial_edit_invalidates() {
+        use std::collections::BTreeMap;
+        let d = tmpdir();
+        write(&d, "base.html", "<html>{% block body %}{% endblock %}</html>");
+        write(
+            &d,
+            "page.html",
+            "{% extends \"base.html\" %}{% block body %}v{{ n }}{% endblock %}",
+        );
+        let c = Builder::new(&d).build().unwrap();
+        let loads = || c.ctx_env.read().unwrap().loads;
+
+        // first render: loads the entry AND its parent via the loader (slow path)
+        assert_eq!(&c.render_ctx("page.html", &BTreeMap::from([("n", 1)])).unwrap(), "<html>v1</html>");
+        assert_eq!(loads(), 1);
+
+        // steady state: unchanged tree -> FAST path, no reload/re-parse
+        assert_eq!(&c.render_ctx("page.html", &BTreeMap::from([("n", 2)])).unwrap(), "<html>v2</html>");
+        assert_eq!(loads(), 1, "steady-state render must not reload");
+
+        // edit the PARTIAL (base.html, a parent — NOT the entry): §9.2a must hold
+        std::thread::sleep(Duration::from_millis(5));
+        write(&d, "base.html", "<div>{% block body %}{% endblock %}</div>");
+        bump_mtime(&d, "base.html");
+        assert_eq!(&c.render_ctx("page.html", &BTreeMap::from([("n", 3)])).unwrap(), "<div>v3</div>");
+        assert_eq!(loads(), 2, "a parent-partial edit must trigger exactly one reload");
+
+        // and back to steady state after the reload
+        assert_eq!(&c.render_ctx("page.html", &BTreeMap::from([("n", 4)])).unwrap(), "<div>v4</div>");
+        assert_eq!(loads(), 2);
     }
 }
