@@ -1,0 +1,16 @@
+[package]
+name = "stand-render"
+version = "0.1.0"
+edition = "2021"
+description = "Shared template + static-asset rendering for Les services (CODESTYLE.md §9): minijinja + an mtime/params-keyed asset cache over a validated dir"
+license = "MIT"
+
+[dependencies]
+minijinja = "2"
+# integrity pins for served logic / library templates (§9.7b, §9.8).
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+# set mtimes forward to test cache invalidation deterministically
+filetime = "0.2"

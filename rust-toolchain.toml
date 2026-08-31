@@ -1,0 +1,3 @@
+# Mirrors /home/dev/dev-shells/shells/rust-stable.nix — bump both together.
+[toolchain]
+channel = "1.98.0"
