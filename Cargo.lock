@@ -18,6 +18,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "common-templating"
+version = "0.1.2"
+dependencies = [
+ "filetime",
+ "minijinja",
+ "serde",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -145,17 +156,6 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
-]
-
-[[package]]
-name = "stand-render"
-version = "0.1.2"
-dependencies = [
- "filetime",
- "minijinja",
- "serde",
- "sha2",
- "thiserror",
 ]
 
 [[package]]

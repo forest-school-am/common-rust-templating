@@ -1,5 +1,5 @@
 [package]
-name = "stand-render"
+name = "common-templating"
 version = "0.1.2"
 edition = "2021"
 description = "Shared template + static-asset rendering for Les services (CODESTYLE.md §9): minijinja + an mtime/params-keyed asset cache over a validated dir"

@@ -27,7 +27,7 @@
             (import "${dev-shells-src}/shells/rust-stable.nix" { inherit pkgs; })
           ];
           env = {
-            CARGO_TARGET_DIR = "/home/dev/.cache/stand-render-target";
+            CARGO_TARGET_DIR = "/home/dev/.cache/common-templating-target";
           };
         };
     };

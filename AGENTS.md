@@ -1,10 +1,10 @@
-# AGENTS.md — stand-render
+# AGENTS.md — common-templating
 
 ## Purpose
 The stand's shared template + static-asset rendering (CODESTYLE.md §9.7):
 minijinja setup + an mtime/params-keyed `AssetCache` over a validated asset
 directory. Used only by services that serve assets — kept SEPARATE from
-`stand-log` so binaries that serve nothing don't pull minijinja.
+`common-logging` so binaries that serve nothing don't pull minijinja.
 
 ## Layout
 - `src/lib.rs` — `Builder` (boot validation + pins), `AssetCache`
@@ -31,9 +31,9 @@ directory. Used only by services that serve assets — kept SEPARATE from
 
 ## Run / test
 `nix develop --impure -c cargo test` (frozen 1.98.0;
-`CARGO_TARGET_DIR=/home/dev/.cache/stand-render-target`). Library only.
+`CARGO_TARGET_DIR=/home/dev/.cache/common-templating-target`). Library only.
 
 ## Stand context
 Implements DECISIONS.md R6 / CODESTYLE.md §9.7–§9.8. First consumers:
-stand-oidc (its served shim → a pinned library template, §9.8) and mint
+common-oidc (its served shim → a pinned library template, §9.8) and mint
 (searchbase.js). Builds serialized under R4's disk regime.
