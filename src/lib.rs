@@ -156,10 +156,15 @@ impl AssetCache {
     /// non-`Normal`/`CurDir` component (`..`, root, prefix) BEFORE touching the
     /// filesystem, then canonicalizes and requires containment under
     /// `canonical_root` — which catches a symlink INSIDE the root pointing out
-    /// (the component check alone would not). A name that is structurally safe
-    /// but simply does not exist yet returns its joined path; the normal
-    /// `Missing` flow handles it downstream (no content can leak from a file
-    /// that is not there).
+    /// (the component check alone would not). `Ok` therefore always means
+    /// "safe AND real": a name that does not resolve to an existing file
+    /// returns `Missing` here rather than an unvalidated path, so no caller
+    /// ever touches a path safe_path hasn't cleared. This also closes the
+    /// intermediate-symlink gap by construction — a `link/newfile` where
+    /// `link` escapes the root but `newfile` is absent is `Missing`, never a
+    /// path a later read would follow out. (`canonicalize` is realpath: a
+    /// permissions error surfaces as `Io`, so `NotFound` genuinely means
+    /// absent.)
     fn safe_path(&self, name: &str) -> Result<PathBuf, RenderError> {
         let rel = Path::new(name);
         for component in rel.components() {
@@ -168,11 +173,12 @@ impl AssetCache {
                 _ => return Err(RenderError::UnsafeName(name.to_owned())),
             }
         }
-        let joined = self.root.join(rel);
-        match joined.canonicalize() {
+        match self.root.join(rel).canonicalize() {
             Ok(real) if real.starts_with(&self.canonical_root) => Ok(real),
             Ok(_) => Err(RenderError::UnsafeName(name.to_owned())), // symlink escaped the root
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(joined),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(RenderError::Missing(name.to_owned()))
+            }
             Err(e) => Err(RenderError::Io(name.to_owned(), e.to_string())),
         }
     }
@@ -567,5 +573,23 @@ mod tests {
             c.static_file("up/outside.txt"),
             Err(RenderError::UnsafeName(_))
         ));
+        // intermediate symlink escapes but the final target is absent: Missing,
+        // NOT an unvalidated path a later read would follow out (the NotFound-arm
+        // hardening — §9.5b).
+        assert!(matches!(
+            c.static_file("up/does-not-exist.txt"),
+            Err(RenderError::Missing(_))
+        ));
+    }
+
+    #[test]
+    fn nonexistent_name_is_missing_not_ok_or_unsafe() {
+        let d = tmpdir();
+        write(&d, "real.txt", "x");
+        let c = Builder::new(&d).build().unwrap();
+        // a structurally-safe name that simply does not exist resolves to
+        // Missing at safe_path — never Ok(unvalidated path), never UnsafeName.
+        assert!(matches!(c.static_file("absent.txt"), Err(RenderError::Missing(_))));
+        assert!(matches!(c.render("absent.js.jinja", &[]), Err(RenderError::Missing(_))));
     }
 }
